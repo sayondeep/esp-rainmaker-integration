@@ -7,13 +7,12 @@ This is a Home Assistant custom integration for ESP RainMaker devices, allowing 
 ## Features
 
 - **Light Control**: Full support for ESP RainMaker light devices with brightness and color control
-- **Sensor Monitoring**: Monitor various sensor readings from your ESP RainMaker devices
 - **Config Flow**: Easy setup through Home Assistant's UI
 - **Cloud Integration**: Connects to ESP RainMaker cloud services for device management
 
 ## Installation
 
-### HACS (Recommended)
+### [HACS](https://www.hacs.xyz/) (Recommended)
 
 1. Open HACS in Home Assistant
 2. Go to "Integrations"
@@ -24,7 +23,7 @@ This is a Home Assistant custom integration for ESP RainMaker devices, allowing 
 
 ### Manual Installation
 
-1. Download the latest release from the [releases page](https://github.com/sayondeep/esp-rainmaker-integration/releases)
+1. Clone the repo.
 2. Extract the contents to your `custom_components/esp-rainmaker/` directory
 3. Restart Home Assistant
 
@@ -38,7 +37,6 @@ This is a Home Assistant custom integration for ESP RainMaker devices, allowing 
 ## Supported Devices
 
 - ESP RainMaker Light devices (with brightness and color control)
-- ESP RainMaker Sensor devices (temperature, humidity, etc.)
 
 ## Contributing
 
