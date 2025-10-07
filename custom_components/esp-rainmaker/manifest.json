@@ -2,9 +2,10 @@
     "domain": "esp-rainmaker",
     "name": "ESP RainMaker",
     "version": "0.1.0",
-    "documentation": "https://github.com/yourname/ha-esp-rainmaker",
+    "documentation": "https://github.com/sayondeep/esp-rainmaker-integration",
+    "issue_tracker": "https://github.com/sayondeep/esp-rainmaker-integration/issues",
     "requirements": ["aiohttp"],
-    "codeowners": ["@yourgithub"],
+    "codeowners": ["@sayondeep"],
     "config_flow": true,
     "iot_class": "cloud_polling",
     "integration_type": "hub"

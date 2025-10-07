@@ -1,0 +1,7 @@
+{
+    "name": "ESP RainMaker",
+    "content_in_root": false,
+    "filename": "esp-rainmaker-integration.zip",
+    "render_readme": true,
+    "domains": ["light", "sensor"]
+}
