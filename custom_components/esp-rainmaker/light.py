@@ -40,11 +40,30 @@ async def async_setup_entry(hass, entry, async_add_entities):
                                 node_details = detail_data.get("details", {}).get("node_details", [])
 
                                 for node_detail in node_details:
-                                    # Check if this node has Light parameters
-                                    params = node_detail.get("params", {})
-                                    if "Light" in params:
-                                        lights.append(RainMakerLight(hass, f"http://{host}:{port}", device, node_detail))
-                                        break
+                                    # Check config.devices for light devices
+                                    config = node_detail.get("config", {})
+                                    devices_config = config.get("devices", [])
+
+                                    for device_config in devices_config:
+                                        device_type = device_config.get("type")
+                                        device_name = device_config.get("name", "Light")
+
+                                        # Check for any light device (lightbulb or dimmer switch)
+                                        is_light_device = (
+                                            device_type == "esp.device.lightbulb" or
+                                            (device_type == "esp.device.switch" and device_config.get("subtype") == "dimmer")
+                                        )
+
+                                        if is_light_device:
+                                            # Check if this device has Power parameter
+                                            has_power = any(
+                                                p.get("name") == "Power" and p.get("type") == "esp.param.power"
+                                                for p in device_config.get("params", [])
+                                            )
+
+                                            if has_power:
+                                                lights.append(RainMakerLight(hass, f"http://{host}:{port}", device, node_detail, device_name, device_config))
+                                                _LOGGER.debug(f"Found light device: {device_name} in node {node_id}")
 
                 _LOGGER.info(f"Found {len(lights)} ESP RainMaker lights")
             else:
@@ -55,37 +74,58 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities(lights, True)
 
 class RainMakerLight(LightEntity):
-    def __init__(self, hass, base_url, device_data, node_detail):
+    def __init__(self, hass, base_url, device_data, node_detail, device_name, device_config):
         self._hass = hass
         self._base_url = base_url
         self._device_data = device_data
         self._node_detail = node_detail
         self._node_id = device_data["node_id"]
+        self._device_param_name = device_name  # Device name used as param key (e.g., "Light", "DMHCM")
+        self._device_config = device_config
+
+        # Use device name as param key
+        self._param_key = device_name
+
+        # Detect capabilities from device config
+        params_config = device_config.get("params", [])
+        self._has_hue = any(p.get("name") == "Hue" and p.get("type") == "esp.param.hue" for p in params_config)
+        self._has_saturation = any(p.get("name") == "Saturation" and p.get("type") == "esp.param.saturation" for p in params_config)
+        self._has_color = self._has_hue and self._has_saturation
+
+        # Detect brightness parameter name (could be "Brightness" or "brightness")
+        has_brightness_cap = any(p.get("name") == "Brightness" and p.get("type") == "esp.param.brightness" for p in params_config)
+        has_brightness_lower = any(p.get("name") == "brightness" and p.get("type") == "esp.param.brightness" for p in params_config)
+        self._brightness_param_name = "Brightness" if has_brightness_cap else ("brightness" if has_brightness_lower else "Brightness")
 
         # Get light parameters from node_detail
         params = node_detail.get("params", {})
-        light_params = params.get("Light", {})
+        light_params = params.get(self._param_key, {})
 
-        # Get device info from node_detail - prioritize Light.Name for the actual device name
-        light_device_name = light_params.get("Name", "")
+        # Get device name from params or fallback
+        device_name_from_params = light_params.get("Name", "")
         fallback_name = node_detail.get("name", device_data.get("name", f"RainMaker Light {self._node_id[:8]}"))
-        self._device_name = light_device_name if light_device_name else fallback_name
+        self._device_name = device_name_from_params if device_name_from_params else fallback_name
 
         self._model = node_detail.get("model", "Unknown")
         self._fw_version = node_detail.get("fw_version", "Unknown")
 
         self._attr_name = self._device_name
-        self._attr_unique_id = f"esp_rainmaker_light_{self._node_id}"
+        unique_id_suffix = f"_{device_name}" if device_name != "Light" else ""
+        self._attr_unique_id = f"esp_rainmaker_light_{self._node_id}{unique_id_suffix}"
 
         # Set initial state from parameters
         self._attr_is_on = light_params.get("Power", False)
-        self._brightness = light_params.get("Brightness", 100)
-        self._hue = light_params.get("Hue", 0)
-        self._saturation = light_params.get("Saturation", 100)
+        self._brightness = light_params.get(self._brightness_param_name, 100)
+        self._hue = light_params.get("Hue", 0) if self._has_hue else 0
+        self._saturation = light_params.get("Saturation", 100) if self._has_saturation else 100
 
-        # Set supported color modes
-        self._attr_supported_color_modes = {ColorMode.HS}
-        self._attr_color_mode = ColorMode.HS
+        # Set supported color modes based on capabilities
+        if self._has_color:
+            self._attr_supported_color_modes = {ColorMode.HS}
+            self._attr_color_mode = ColorMode.HS
+        else:
+            self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+            self._attr_color_mode = ColorMode.BRIGHTNESS
 
         # Set faster polling for more responsive updates (10 seconds instead of 30)
         from datetime import timedelta
@@ -119,15 +159,17 @@ class RainMakerLight(LightEntity):
     @property
     def extra_state_attributes(self):
         """Return additional attributes."""
-        return {
+        attrs = {
             "node_id": self._node_id,
             "device_type": "rainmaker_light",
             "model": self._model,
             "firmware_version": self._fw_version,
             "raw_brightness": self._brightness,
-            "raw_hue": self._hue,
-            "raw_saturation": self._saturation,
         }
+        if self._has_color:
+            attrs["raw_hue"] = self._hue
+            attrs["raw_saturation"] = self._saturation
+        return attrs
 
     async def async_turn_on(self, **kwargs):
         """Turn on the light."""
@@ -141,14 +183,14 @@ class RainMakerLight(LightEntity):
         # Convert brightness from 0-255 to 0-100
         if brightness is not None:
             brightness_pct = int(brightness * 100 / 255)
-            light_data["Brightness"] = brightness_pct
+            light_data[self._brightness_param_name] = brightness_pct
             self._brightness = brightness_pct
         else:
             # If no brightness specified, use current brightness or default to 100
-            light_data["Brightness"] = self._brightness if self._brightness > 0 else 100
+            light_data[self._brightness_param_name] = self._brightness if self._brightness > 0 else 100
 
-        # Convert HS color
-        if hs_color is not None:
+        # Convert HS color (only if device supports it)
+        if self._has_color and hs_color is not None:
             hue, saturation = hs_color
             light_data["Hue"] = int(hue)
             light_data["Saturation"] = int(saturation)
@@ -167,7 +209,8 @@ class RainMakerLight(LightEntity):
         """Send command to ESP RainMaker device."""
         try:
             session = async_get_clientsession(self._hass)
-            payload = {"Light": light_data}
+            # Use correct param key: "Light" for regular lights, device name for dimmers
+            payload = {self._param_key: light_data}
 
             async with session.post(
                 f"{self._base_url}/setparams/{self._node_id}",
@@ -180,8 +223,8 @@ class RainMakerLight(LightEntity):
                         # Update local state immediately for instant UI feedback
                         if "Power" in light_data:
                             self._attr_is_on = light_data["Power"]
-                        if "Brightness" in light_data:
-                            self._brightness = light_data["Brightness"]
+                        if self._brightness_param_name in light_data:
+                            self._brightness = light_data[self._brightness_param_name]
                         if "Hue" in light_data:
                             self._hue = light_data["Hue"]
                         if "Saturation" in light_data:
@@ -210,11 +253,14 @@ class RainMakerLight(LightEntity):
             _LOGGER.warning(f"Cannot set brightness on {self._device_name}: light is off")
             return
 
-        light_data = {"Brightness": brightness_pct}
+        light_data = {self._brightness_param_name: brightness_pct}
         await self._send_command(light_data, f"set brightness to {brightness_pct}%")
 
     async def async_set_hs_color(self, hue, saturation):
         """Set hue and saturation without changing power state."""
+        if not self._has_color:
+            _LOGGER.warning(f"Cannot set color on {self._device_name}: device does not support color")
+            return
         if not self._attr_is_on:
             _LOGGER.warning(f"Cannot set color on {self._device_name}: light is off")
             return
@@ -228,6 +274,9 @@ class RainMakerLight(LightEntity):
 
     async def async_set_hue(self, hue):
         """Set hue only without changing power state or saturation."""
+        if not self._has_color:
+            _LOGGER.warning(f"Cannot set hue on {self._device_name}: device does not support color")
+            return
         if not self._attr_is_on:
             _LOGGER.warning(f"Cannot set hue on {self._device_name}: light is off")
             return
@@ -238,6 +287,9 @@ class RainMakerLight(LightEntity):
 
     async def async_set_saturation(self, saturation):
         """Set saturation only without changing power state or hue."""
+        if not self._has_color:
+            _LOGGER.warning(f"Cannot set saturation on {self._device_name}: device does not support color")
+            return
         if not self._attr_is_on:
             _LOGGER.warning(f"Cannot set saturation on {self._device_name}: light is off")
             return
@@ -248,6 +300,9 @@ class RainMakerLight(LightEntity):
 
     async def async_set_full_color(self, brightness_pct=None, hue=None, saturation=None):
         """Set brightness, hue, and saturation in one command."""
+        if not self._has_color and (hue is not None or saturation is not None):
+            _LOGGER.warning(f"Cannot set color on {self._device_name}: device does not support color")
+            return
         if not self._attr_is_on:
             _LOGGER.warning(f"Cannot set color on {self._device_name}: light is off")
             return
@@ -257,18 +312,19 @@ class RainMakerLight(LightEntity):
 
         if brightness_pct is not None:
             brightness_pct = max(0, min(100, int(brightness_pct)))
-            light_data["Brightness"] = brightness_pct
-            params.append(f"Brightness:{brightness_pct}%")
+            light_data[self._brightness_param_name] = brightness_pct
+            params.append(f"brightness:{brightness_pct}%")
 
-        if hue is not None:
-            hue = max(0, min(360, int(hue)))
-            light_data["Hue"] = hue
-            params.append(f"Hue:{hue}°")
+        if self._has_color:
+            if hue is not None:
+                hue = max(0, min(360, int(hue)))
+                light_data["Hue"] = hue
+                params.append(f"Hue:{hue}°")
 
-        if saturation is not None:
-            saturation = max(0, min(100, int(saturation)))
-            light_data["Saturation"] = saturation
-            params.append(f"Saturation:{saturation}%")
+            if saturation is not None:
+                saturation = max(0, min(100, int(saturation)))
+                light_data["Saturation"] = saturation
+                params.append(f"Saturation:{saturation}%")
 
         if light_data:
             params_str = ", ".join(params)
@@ -281,11 +337,11 @@ class RainMakerLight(LightEntity):
         self.async_write_ha_state()
 
     def _update_device_name(self, light_params):
-        """Update device name from Light.Name parameter and notify Home Assistant of the change."""
-        light_device_name = light_params.get("Name", "")
-        if light_device_name and light_device_name != self._device_name:
+        """Update device name from Name parameter and notify Home Assistant of the change."""
+        device_name_from_params = light_params.get("Name", "")
+        if device_name_from_params and device_name_from_params != self._device_name:
             old_name = self._device_name
-            self._device_name = light_device_name
+            self._device_name = device_name_from_params
             self._attr_name = self._device_name
             _LOGGER.info(f"Device name updated from '{old_name}' to '{self._device_name}' for node {self._node_id}")
 
@@ -294,12 +350,12 @@ class RainMakerLight(LightEntity):
 
             # Force Home Assistant to update the entity name by marking it as changed
             self.async_write_ha_state()
-        elif light_device_name and light_device_name == self._device_name:
+        elif device_name_from_params and device_name_from_params == self._device_name:
             # Name is already correct, no change needed
             pass
         else:
-            # No name in Light parameters, keep current name
-            _LOGGER.debug(f"No Name parameter in Light data for {self._node_id}, keeping current name: {self._device_name}")
+            # No name in parameters, keep current name
+            _LOGGER.debug(f"No Name parameter in {self._param_key} data for {self._node_id}, keeping current name: {self._device_name}")
 
     def _update_device_registry(self):
         """Update the device registry with the new device name."""
@@ -335,21 +391,24 @@ class RainMakerLight(LightEntity):
                     data = await resp.json()
                     params = data.get("params", {})
 
-                    if "Light" in params:
-                        light_params = params["Light"]
+                    if self._param_key in params:
+                        light_params = params[self._param_key]
 
                         # Update device name first (this may trigger HA state update)
                         self._update_device_name(light_params)
 
                         # Update light state
                         self._attr_is_on = light_params.get("Power", False)
-                        self._brightness = light_params.get("Brightness", 100)
-                        self._hue = light_params.get("Hue", 0)
-                        self._saturation = light_params.get("Saturation", 100)
+                        self._brightness = light_params.get(self._brightness_param_name, 100)
 
-                        _LOGGER.debug(f"Updated {self._device_name}: Power={self._attr_is_on}, Brightness={self._brightness}, Hue={self._hue}, Saturation={self._saturation}")
+                        if self._has_color:
+                            self._hue = light_params.get("Hue", 0)
+                            self._saturation = light_params.get("Saturation", 100)
+                            _LOGGER.debug(f"Updated {self._device_name}: Power={self._attr_is_on}, {self._brightness_param_name}={self._brightness}, Hue={self._hue}, Saturation={self._saturation}")
+                        else:
+                            _LOGGER.debug(f"Updated {self._device_name}: Power={self._attr_is_on}, {self._brightness_param_name}={self._brightness}")
                     else:
-                        _LOGGER.warning(f"No Light parameters found for {self._node_id}")
+                        _LOGGER.warning(f"No {self._param_key} parameters found for {self._node_id}")
 
                 else:
                     _LOGGER.error(f"Failed to fetch params for {self._node_id}: HTTP {resp.status}")
