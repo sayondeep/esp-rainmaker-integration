@@ -4,7 +4,6 @@ from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_HS_COLOR,
 )
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import DeviceInfo
 from .const import DOMAIN
 import logging
@@ -13,70 +12,63 @@ import colorsys
 _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    host = entry.data["host"]
-    port = entry.data["port"]
-    url = f"http://{host}:{port}/rainmakernodes"
+    entry_data = hass.data[DOMAIN][entry.entry_id]
+    ws_client = entry_data["ws_client"]
 
     # Create light entities for RainMaker light devices
     lights = []
 
     # Try to get RainMaker nodes and create light entities
     try:
-        session = async_get_clientsession(hass)
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                devices = data.get("devices", [])
+        # Get devices list via WebSocket
+        response = await ws_client.send_request("rainmakernodes")
+        devices = response.get("devices", [])
 
-                for device in devices:
-                    # Check if this device has Light parameters (indicating it's a light device)
-                    node_id = device.get("node_id")
-                    if node_id:
-                        # Get detailed device info to check for light capabilities
-                        detail_url = f"http://{host}:{port}/nodedetails/{node_id}"
-                        async with session.get(detail_url) as detail_resp:
-                            if detail_resp.status == 200:
-                                detail_data = await detail_resp.json()
-                                node_details = detail_data.get("details", {}).get("node_details", [])
+        for device in devices:
+            # Check if this device has Light parameters (indicating it's a light device)
+            node_id = device.get("node_id")
+            if node_id:
+                # Get detailed device info to check for light capabilities
+                detail_response = await ws_client.send_request("nodedetails", {"node_id": node_id})
+                node_details_data = detail_response.get("details", {})
+                node_details = node_details_data.get("node_details", [])
 
-                                for node_detail in node_details:
-                                    # Check config.devices for light devices
-                                    config = node_detail.get("config", {})
-                                    devices_config = config.get("devices", [])
+                for node_detail in node_details:
+                    # Check config.devices for light devices
+                    config = node_detail.get("config", {})
+                    devices_config = config.get("devices", [])
 
-                                    for device_config in devices_config:
-                                        device_type = device_config.get("type")
-                                        device_name = device_config.get("name", "Light")
+                    for device_config in devices_config:
+                        device_type = device_config.get("type")
+                        device_name = device_config.get("name", "Light")
 
-                                        # Check for any light device (lightbulb or dimmer switch)
-                                        is_light_device = (
-                                            device_type == "esp.device.lightbulb" or
-                                            (device_type == "esp.device.switch" and device_config.get("subtype") == "dimmer")
-                                        )
+                        # Check for any light device (lightbulb or dimmer switch)
+                        is_light_device = (
+                            device_type == "esp.device.lightbulb" or
+                            (device_type == "esp.device.switch" and device_config.get("subtype") == "dimmer")
+                        )
 
-                                        if is_light_device:
-                                            # Check if this device has Power parameter
-                                            has_power = any(
-                                                p.get("name") == "Power" and p.get("type") == "esp.param.power"
-                                                for p in device_config.get("params", [])
-                                            )
+                        if is_light_device:
+                            # Check if this device has Power parameter
+                            has_power = any(
+                                p.get("name") == "Power" and p.get("type") == "esp.param.power"
+                                for p in device_config.get("params", [])
+                            )
 
-                                            if has_power:
-                                                lights.append(RainMakerLight(hass, f"http://{host}:{port}", device, node_detail, device_name, device_config))
-                                                _LOGGER.debug(f"Found light device: {device_name} in node {node_id}")
+                            if has_power:
+                                lights.append(RainMakerLight(hass, ws_client, device, node_detail, device_name, device_config))
+                                _LOGGER.debug(f"Found light device: {device_name} in node {node_id}")
 
-                _LOGGER.info(f"Found {len(lights)} ESP RainMaker lights")
-            else:
-                _LOGGER.error(f"Failed to fetch RainMaker nodes: HTTP {resp.status}")
+        _LOGGER.info(f"Found {len(lights)} ESP RainMaker lights")
     except Exception as e:
         _LOGGER.warning(f"Could not fetch RainMaker nodes during setup: {e}")
 
     async_add_entities(lights, True)
 
 class RainMakerLight(LightEntity):
-    def __init__(self, hass, base_url, device_data, node_detail, device_name, device_config):
+    def __init__(self, hass, ws_client, device_data, node_detail, device_name, device_config):
         self._hass = hass
-        self._base_url = base_url
+        self._ws_client = ws_client
         self._device_data = device_data
         self._node_detail = node_detail
         self._node_id = device_data["node_id"]
@@ -206,46 +198,52 @@ class RainMakerLight(LightEntity):
         await self._send_command(light_data, "turn off")
 
     async def _send_command(self, light_data, action_description):
-        """Send command to ESP RainMaker device."""
+        """Send command to ESP RainMaker device via WebSocket."""
         try:
-            session = async_get_clientsession(self._hass)
             # Use correct param key: "Light" for regular lights, device name for dimmers
             payload = {self._param_key: light_data}
 
-            async with session.post(
-                f"{self._base_url}/setparams/{self._node_id}",
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            ) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
-                    if result.get("success", False):
-                        # Update local state immediately for instant UI feedback
-                        if "Power" in light_data:
-                            self._attr_is_on = light_data["Power"]
-                        if self._brightness_param_name in light_data:
-                            self._brightness = light_data[self._brightness_param_name]
-                        if "Hue" in light_data:
-                            self._hue = light_data["Hue"]
-                        if "Saturation" in light_data:
-                            self._saturation = light_data["Saturation"]
+            response = await self._ws_client.send_request(
+                "setparams",
+                {"node_id": self._node_id, "data": payload}
+            )
 
-                        # Create detailed log message
-                        params_str = ", ".join([f"{k}={v}" for k, v in light_data.items()])
-                        _LOGGER.info(f"Successfully {action_description} {self._device_name}: {params_str}")
+            # Check if device is offline
+            if response.get("offline", False):
+                _LOGGER.warning(f"Cannot {action_description} {self._device_name}: device is offline")
+                return
 
-                        # Immediate state update for UI responsiveness
-                        self.async_write_ha_state()
+            if response.get("success", False):
+                # Update local state immediately for instant UI feedback
+                if "Power" in light_data:
+                    self._attr_is_on = light_data["Power"]
+                if self._brightness_param_name in light_data:
+                    self._brightness = light_data[self._brightness_param_name]
+                if "Hue" in light_data:
+                    self._hue = light_data["Hue"]
+                if "Saturation" in light_data:
+                    self._saturation = light_data["Saturation"]
 
-                        # Schedule a delayed refresh to get actual device state (2 seconds later)
-                        self._hass.loop.call_later(2.0, lambda: self._hass.async_create_task(self.async_update()))
+                # Create detailed log message
+                params_str = ", ".join([f"{k}={v}" for k, v in light_data.items()])
+                _LOGGER.info(f"Successfully {action_description} {self._device_name}: {params_str}")
 
-                    else:
-                        _LOGGER.error(f"Failed to {action_description} {self._device_name}: {result.get('error', 'Unknown error')}")
-                else:
-                    _LOGGER.error(f"HTTP error during {action_description} {self._device_name}: {resp.status}")
+                # Immediate state update for UI responsiveness
+                self.async_write_ha_state()
+
+                # Schedule a delayed refresh to get actual device state (2 seconds later)
+                self._hass.loop.call_later(2.0, lambda: self._hass.async_create_task(self.async_update()))
+
+            else:
+                error_msg = response.get('error', 'Unknown error')
+                # Don't log errors for offline devices - they're expected
+                if "offline" not in error_msg.lower():
+                    _LOGGER.error(f"Failed to {action_description} {self._device_name}: {error_msg}")
         except Exception as e:
-            _LOGGER.error(f"Error during {action_description} {self._device_name}: {e}")
+            error_msg = str(e).lower()
+            # Don't log errors for offline devices - they're expected
+            if "offline" not in error_msg and "could not connect" not in error_msg:
+                _LOGGER.error(f"Error during {action_description} {self._device_name}: {e}")
 
     async def async_set_brightness(self, brightness_pct):
         """Set brightness without changing power state (custom method)."""
@@ -382,35 +380,41 @@ class RainMakerLight(LightEntity):
             _LOGGER.error(f"Failed to update device registry for {self._node_id}: {e}")
 
     async def async_update(self):
-        """Update the light state using efficient getparams endpoint."""
+        """Update the light state using efficient getparams endpoint via WebSocket."""
         try:
-            session = async_get_clientsession(self._hass)
-            # Use the more efficient getparams endpoint instead of nodedetails
-            async with session.get(f"{self._base_url}/getparams/{self._node_id}") as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    params = data.get("params", {})
+            response = await self._ws_client.send_request(
+                "getparams",
+                {"node_id": self._node_id}
+            )
 
-                    if self._param_key in params:
-                        light_params = params[self._param_key]
+            # Check if device is offline
+            if response.get("offline", False):
+                _LOGGER.debug(f"Device {self._device_name} is offline, skipping update")
+                return
 
-                        # Update device name first (this may trigger HA state update)
-                        self._update_device_name(light_params)
+            params = response.get("params", {})
 
-                        # Update light state
-                        self._attr_is_on = light_params.get("Power", False)
-                        self._brightness = light_params.get(self._brightness_param_name, 100)
+            if self._param_key in params:
+                light_params = params[self._param_key]
 
-                        if self._has_color:
-                            self._hue = light_params.get("Hue", 0)
-                            self._saturation = light_params.get("Saturation", 100)
-                            _LOGGER.debug(f"Updated {self._device_name}: Power={self._attr_is_on}, {self._brightness_param_name}={self._brightness}, Hue={self._hue}, Saturation={self._saturation}")
-                        else:
-                            _LOGGER.debug(f"Updated {self._device_name}: Power={self._attr_is_on}, {self._brightness_param_name}={self._brightness}")
-                    else:
-                        _LOGGER.warning(f"No {self._param_key} parameters found for {self._node_id}")
+                # Update device name first (this may trigger HA state update)
+                self._update_device_name(light_params)
 
+                # Update light state
+                self._attr_is_on = light_params.get("Power", False)
+                self._brightness = light_params.get(self._brightness_param_name, 100)
+
+                if self._has_color:
+                    self._hue = light_params.get("Hue", 0)
+                    self._saturation = light_params.get("Saturation", 100)
+                    _LOGGER.debug(f"Updated {self._device_name}: Power={self._attr_is_on}, {self._brightness_param_name}={self._brightness}, Hue={self._hue}, Saturation={self._saturation}")
                 else:
-                    _LOGGER.error(f"Failed to fetch params for {self._node_id}: HTTP {resp.status}")
+                    _LOGGER.debug(f"Updated {self._device_name}: Power={self._attr_is_on}, {self._brightness_param_name}={self._brightness}")
+            else:
+                _LOGGER.warning(f"No {self._param_key} parameters found for {self._node_id}")
+
         except Exception as e:
-            _LOGGER.error(f"Error updating RainMaker light {self._node_id}: {e}")
+            error_msg = str(e).lower()
+            # Don't log errors for offline devices - they're expected
+            if "offline" not in error_msg and "could not connect" not in error_msg:
+                _LOGGER.error(f"Error updating RainMaker light {self._node_id}: {e}")
